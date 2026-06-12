@@ -72,6 +72,32 @@ class TuicManager {
         return false;
     }
 
+    /**
+     * Generate a TUIC connection link for a user
+     */
+    public function getTuicLink($uuid, $overrideHostname = null) {
+        $config = $this->readConfig();
+        $users = $config['users'] ?? [];
+        if (!isset($users[$uuid])) {
+            return false;
+        }
+
+        $password = $users[$uuid];
+        $settings = $config['settings'] ?? [];
+
+        $server = $settings['server'] ?? '[::]:8443';
+        $port = 8443;
+        if (preg_match('/:(\d+)$/', $server, $matches)) {
+            $port = $matches[1];
+        }
+
+        $hostname = $overrideHostname ?: ($settings['tls.hostname'] ?? 'localhost');
+        $cc = $settings['quic.congestion_control.controller'] ?? 'bbr';
+        $alpn = $settings['tls.alpn'] ?? 'h3';
+
+        return "tuic://$uuid:$password@$hostname:$port/?congestion_control=$cc&alpn=$alpn&udp_relay_mode=native&allow_insecure=1";
+    }
+
     private function callApi($endpoint, $method = 'GET', $data = null) {
         $ch = curl_init($this->apiUrl . $endpoint);
         $headers = [
@@ -101,34 +127,51 @@ class TuicManager {
     }
 
     /**
-     * Simple TOML parser for the users section
+     * Simple TOML parser for users and basic settings
      */
     private function readConfig() {
         if (!file_exists($this->configPath)) {
-            return [];
+            return ['users' => [], 'settings' => [], 'raw_lines' => []];
         }
 
         $content = file_get_contents($this->configPath);
         $lines = explode("\n", $content);
-        $config = ['users' => [], 'raw_lines' => $lines];
+        $config = ['users' => [], 'settings' => [], 'raw_lines' => $lines];
 
-        $inUsersSection = false;
+        $currentSection = "";
         foreach ($lines as $line) {
             $trimmed = trim($line);
-            if ($trimmed === '[users]') {
-                $inUsersSection = true;
-                continue;
-            }
-            if ($inUsersSection && strpos($trimmed, '[') === 0) {
-                $inUsersSection = false;
+            if (empty($trimmed) || $trimmed[0] === '#') {
                 continue;
             }
 
-            if ($inUsersSection && !empty($trimmed) && strpos($trimmed, '=') !== false) {
-                list($uuid, $pass) = explode('=', $trimmed, 2);
-                $uuid = trim($uuid, " \t\n\r\0\x0B\"'");
-                $pass = trim($pass, " \t\n\r\0\x0B\"'");
-                $config['users'][$uuid] = $pass;
+            if ($trimmed[0] === '[' && substr($trimmed, -1) === ']') {
+                $currentSection = substr($trimmed, 1, -1);
+                continue;
+            }
+
+            if (strpos($trimmed, '=') !== false) {
+                list($key, $val) = explode('=', $trimmed, 2);
+                $key = trim($key, " \t\n\r\0\x0B\"'");
+                $val = trim($val);
+
+                // Handle arrays like alpn = ["h3", "spdy/3.1"]
+                if ($val !== "" && $val[0] === '[' && substr($val, -1) === ']') {
+                    $val = trim($val, '[]');
+                    $parts = explode(',', $val);
+                    $val = implode(',', array_map(function($v) {
+                        return trim($v, " \t\n\r\0\x0B\"'");
+                    }, $parts));
+                } else {
+                    $val = trim($val, " \t\n\r\0\x0B\"'");
+                }
+
+                if ($currentSection === 'users') {
+                    $config['users'][$key] = $val;
+                } else {
+                    $fullKey = $currentSection ? "$currentSection.$key" : $key;
+                    $config['settings'][$fullKey] = $val;
+                }
             }
         }
 
@@ -177,7 +220,20 @@ class TuicManager {
             }
         }
 
-        return file_put_contents($this->configPath, implode("\n", $newLines)) !== false;
+        $result = file_put_contents($this->configPath, implode("\n", $newLines)) !== false;
+        if ($result) {
+            $this->restartService();
+        }
+        return $result;
+    }
+
+    /**
+     * Try to restart the tuic service so changes take effect
+     */
+    private function restartService() {
+        // This requires the web user to have sudo permissions for this specific command
+        // or for the server to be running in a way that it watches the config file.
+        // shell_exec('sudo systemctl restart tuic');
     }
 }
 
